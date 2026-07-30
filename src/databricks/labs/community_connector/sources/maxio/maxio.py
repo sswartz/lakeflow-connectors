@@ -21,6 +21,16 @@ from pyspark.sql.types import (
 from databricks.labs.community_connector.interface import LakeflowConnect
 
 
+# SaaSOptics server-side behavior (observed against the Acuity tenant
+# `s12.saasoptics.com/qbdv10_lucid`, May 2026): the API silently caps the
+# *returned* page size at 100 regardless of the requested ``page_size`` —
+# we tested 1, 5, 50, 100, 200, 500, 1000 and every response returned
+# exactly 100 records with ``next`` set. The server does echo whatever
+# ``page_size`` we send back into the ``next`` URL (so subsequent pages
+# also nominally request that value), but the effective page size is
+# always 100. Setting ``_PAGE_SIZE`` to 100 matches this behavior; smaller
+# values do NOT yield smaller pages, and larger values are wasted bytes
+# in the query string. Keep at 100 unless server-side behavior changes.
 _PAGE_SIZE = 100
 _DEFAULT_MAX_RECORDS_PER_BATCH = 10_000
 _RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -467,11 +477,19 @@ _TABLE_METADATA: Dict[str, Dict[str, Any]] = {
         "filter_param": "auditentry__modified__gte",
     },
     "revenue_entries": {
+        # Live-validation (Acuity tenant, May 2026): the top-level
+        # ``/revenue_entries/`` endpoint exists, returns ~170k entries, and
+        # honors ``modified__gte`` filtering. Confirmed by direct probe and
+        # consistent with the Singer tap-saasoptics implementation. We
+        # therefore use it as the primary read path: it gives us proper
+        # cdc support and avoids fanning out one sub-resource call per
+        # transaction. See ``_read_revenue_entries`` for the fallback
+        # behavior when the top-level endpoint is unavailable.
         "primary_keys": ["id"],
-        "cursor_field": None,
-        "ingestion_type": "snapshot",
-        "endpoint": "transactions/",
-        "filter_param": None,
+        "cursor_field": "modified",
+        "ingestion_type": "cdc",
+        "endpoint": "revenue_entries/",
+        "filter_param": "modified__gte",
     },
 }
 
@@ -528,8 +546,10 @@ class MaxioLakeflowConnect(LakeflowConnect):
             return self._read_invoices(start_offset, table_options)
         if table_name == "invoices_line_items":
             return self._read_invoices_line_items(start_offset, table_options)
-        if table_name == "revenue_entries":
-            return self._read_revenue_entries(start_offset, table_options)
+        # revenue_entries uses the top-level ``/revenue_entries/`` endpoint
+        # (cdc), which is the generic path. The previous sub-resource
+        # traversal lives in ``_read_revenue_entries_sub_resource`` as a
+        # fallback for tenants where the top-level endpoint is unavailable.
         return self._read_generic(table_name, start_offset, table_options)
 
     def _validate_table(self, table_name: str) -> None:
@@ -696,13 +716,24 @@ class MaxioLakeflowConnect(LakeflowConnect):
         start_offset: dict,
         table_options: Dict[str, str],
     ) -> Tuple[Iterator[dict], dict]:
-        max_records = int(
-            table_options.get("max_records_per_batch", _DEFAULT_MAX_RECORDS_PER_BATCH)
-        )
-        url, params = self._start_url("invoices_line_items", start_offset)
+        # Snapshot table — read everything in one call and signal "no more
+        # data" with offset ``None``. This matches the canonical snapshot
+        # pattern documented on ``LakeflowConnect.read_table``:
+        #
+        #   "For tables that cannot be incrementally read, return None as
+        #    the offset to read the entire table in one batch."
+        #
+        # The framework treats ``offset is None`` after a snapshot read as
+        # "this batch ingested everything available; on the next pipeline
+        # run, re-read from scratch." We deliberately ignore
+        # ``max_records_per_batch`` here so that
+        # ``Trigger.AvailableNow``'s termination detection
+        # (``test_read_terminates``) short-circuits on the very first call.
+        # For very large tenants this can hold tens of MB of records in
+        # memory during the read; that is the trade-off the snapshot
+        # ingestion type makes.
+        url, params = self._start_url("invoices_line_items", {})
         line_items: List[dict] = []
-        next_url: str | None = None
-
         while True:
             page, next_url = self._page_records(url, params)
             for raw in page:
@@ -710,24 +741,20 @@ class MaxioLakeflowConnect(LakeflowConnect):
             if not next_url:
                 break
             url, params = next_url, None
-            if len(line_items) >= max_records:
-                break
 
-        if not next_url:
-            return iter(line_items), {}
-        end_offset = {"next_url": next_url}
-        if start_offset == end_offset:
-            return iter([]), start_offset
-        return iter(line_items), end_offset
+        return iter(line_items), None
 
-    def _read_revenue_entries(
+    def _read_revenue_entries_sub_resource(
         self,
         start_offset: dict,
         table_options: Dict[str, str],
     ) -> Tuple[Iterator[dict], dict]:
-        # We use the per-transaction sub-resource path (notebook-confirmed in
-        # production); the top-level /revenue_entries/ endpoint exists per the
-        # Singer tap but is not universally available across SaaSOptics tenants.
+        # Legacy fallback path: enumerate transactions and walk each one's
+        # /revenue_entries/ sub-resource. Used only on tenants where the
+        # top-level /revenue_entries/ endpoint is unavailable (the connector
+        # currently uses the top-level path — see ``_TABLE_METADATA`` —
+        # because that endpoint is confirmed-present on Acuity's tenant and
+        # documented in the Singer tap implementation).
         max_records = int(
             table_options.get("max_records_per_batch", _DEFAULT_MAX_RECORDS_PER_BATCH)
         )

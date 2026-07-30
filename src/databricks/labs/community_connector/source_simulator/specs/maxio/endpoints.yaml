@@ -116,10 +116,30 @@ endpoints:
       cursor_field: auditentry.modified
       count: 3
 
-  # Sub-resource fanned out by ``_read_revenue_entries``. The path includes the
-  # parent transaction id; the simulator returns the same corpus per call,
-  # which is fine because the connector back-fills ``transaction`` from the
-  # parent id whenever the field is missing on a record.
+  # Top-level revenue_entries endpoint, confirmed-present on Acuity's
+  # tenant during live validation (May 2026). Supports ``modified__gte``
+  # filtering; the connector uses this as the primary cdc read path.
+  - path: "/{account_name}/api/v1.0/revenue_entries/"
+    method: GET
+    corpus: revenue_entries
+    response:
+      pagination_style: none
+      wrapper:
+        records_key: results
+        extras:
+          count: 0
+          next: null
+          previous: null
+    params:
+      page_size:        {role: per_page, default: 100, max: 500}
+      modified__gte:    {role: filter, field: modified, op: gte}
+      modified__lte:    {role: filter, field: modified, op: lte}
+    synthesize_future_records:
+      cursor_field: modified
+      count: 3
+
+  # Legacy sub-resource path; left in the spec so simulate-mode tests of the
+  # fallback ``_read_revenue_entries_sub_resource`` would still match.
   - path: "/{account_name}/api/v1.0/transactions/{transaction_id}/revenue_entries/"
     method: GET
     corpus: revenue_entries

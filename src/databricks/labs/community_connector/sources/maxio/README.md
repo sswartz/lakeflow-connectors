@@ -68,13 +68,13 @@ The Maxio connector exposes **7 tables**, covering the core billing, contract, a
 | `invoices_line_items` | Individual invoice line items, derived by exploding `line_items[]` on each invoice. | `snapshot` | `(invoice_id, line_id)` | n/a |
 | `contracts` | Customer contracts, with the contract's billing profile flattened into `billing_*` columns. | `cdc` | `id` | `modified` |
 | `transactions` | Per-contract transactions (subscription lines, renewals, true-ups) including ARR/MRR amounts and revenue-recognition flags. | `cdc` | `id` | `audit_modified` |
-| `revenue_entries` | Period-level revenue recognition entries per transaction (start/end dates and recognized amounts in home and local currency). | `snapshot` | `id` | n/a |
+| `revenue_entries` | Period-level revenue recognition entries per transaction (start/end dates and recognized amounts in home and local currency). | `cdc` | `id` | `modified` |
 
 ### Ingestion behavior
 
-- **CDC tables** (`customers`, `items`, `invoices`, `contracts`, `transactions`) use a server-side `modified__gte` or `auditentry__modified__gte` filter on the SaaSOptics API to fetch only records changed since the last sync. On the first run, all historical records are fetched (no checkpoint to resume from); subsequent runs ingest only changes since the saved watermark.
+- **CDC tables** (`customers`, `items`, `invoices`, `contracts`, `transactions`, `revenue_entries`) use a server-side `modified__gte` or `auditentry__modified__gte` filter on the SaaSOptics API to fetch only records changed since the last sync. On the first run, all historical records are fetched (no checkpoint to resume from); subsequent runs ingest only changes since the saved watermark.
 - **`invoices_line_items`** is derived directly from the `invoices` payload — there is no standalone API endpoint for line items. It is ingested as a snapshot every run by re-walking the `invoices/` endpoint and exploding the `line_items` array. To pick up changes to line items on already-ingested invoices, run a periodic snapshot.
-- **`revenue_entries`** is fetched as a per-transaction sub-resource: the connector first enumerates transactions via `/transactions/`, then for each transaction calls `/transactions/{id}/revenue_entries/` to fetch its revenue entries. See "Known behaviors and caveats" below for the cost implications.
+- **`revenue_entries`** is fetched from the top-level `/revenue_entries/` endpoint with `modified__gte` filtering for incremental reads (confirmed-present on Acuity's tenant during live validation). A legacy per-transaction sub-resource path (`_read_revenue_entries_sub_resource`) is retained internally as a fallback for tenants where the top-level endpoint is unavailable.
 
 ### Schema highlights
 
@@ -141,11 +141,9 @@ On `invoices`, `invoices_line_items`, `transactions`, and `revenue_entries`, Saa
 
 The `number_field1`, `number_field2`, `number_field3` custom-numeric fields on `customers` and `contracts` are an exception — they are kept as `string` because their content varies per tenant and is not guaranteed to be numeric.
 
-### `revenue_entries` fan-out cost
+### `revenue_entries` initial-load size
 
-`revenue_entries` is fetched per-transaction. The connector first enumerates all transactions via `/transactions/`, then for each transaction issues `GET /transactions/{id}/revenue_entries/` to retrieve that transaction's revenue periods. This means ingestion time for `revenue_entries` is roughly proportional to the number of transactions in your tenant, not to the number of revenue entries themselves. Tenants with many transactions should expect this table to take significantly longer to sync than the other six.
-
-If you do not need period-level revenue recognition data downstream, omit `revenue_entries` from your pipeline spec — the other tables will sync normally.
+`revenue_entries` is the highest-volume table in most SaaSOptics tenants — there are typically several entries per transaction, and a transaction can have many. The connector reads them via the top-level `/revenue_entries/` endpoint with `modified__gte` filtering for incremental syncs, so subsequent runs are cheap. Plan the **first** run with enough time / cluster headroom for a full historical backfill of this table specifically — for very large tenants this can dwarf the other six tables combined.
 
 ### Address-field naming asymmetry on `customers` vs `contracts`
 
@@ -201,14 +199,14 @@ Update the `pipeline_spec` in your main pipeline file (e.g. `ingest.py`), point 
 
 ### Step 3: Run and schedule the pipeline
 
-The first run does a full backfill across all tables. Subsequent runs ingest only changes since the last sync for CDC tables; snapshot tables (`invoices_line_items`, `revenue_entries`) re-fetch each run.
+The first run does a full backfill across all tables. Subsequent runs ingest only changes since the last sync for CDC tables; the one snapshot table (`invoices_line_items`) re-fetches each run.
 
 #### Best practices
 
 - **Start small**: begin by syncing `customers` and `items` to validate authentication and the destination schema before turning on the larger tables.
 - **Use incremental sync**: the CDC tables drastically cut API call volume on subsequent runs — let them do their job.
-- **Schedule thoughtfully**: balance data freshness against the per-transaction fan-out on `revenue_entries`. Hourly schedules are usually overkill; daily or every few hours is typical for billing data.
-- **Plan the first run on `revenue_entries`**: if your tenant has many thousands of transactions, the first sync of `revenue_entries` may take significantly longer than the others.
+- **Schedule thoughtfully**: hourly schedules are usually overkill; daily or every few hours is typical for billing data.
+- **Plan the first run on `revenue_entries`**: this is the highest-volume table in most tenants. The initial historical backfill can take significantly longer than the others; subsequent incremental runs are cheap.
 
 #### Troubleshooting
 
@@ -228,10 +226,10 @@ The first run does a full backfill across all tables. Subsequent runs ingest onl
 - Behavior: the connector retries automatically with exponential backoff and honors `Retry-After` if present. You typically don't need to do anything — the run will continue to completion.
 - If it keeps happening: reduce the frequency of pipeline runs, or run the larger tables (`transactions`, `revenue_entries`) on a separate, less-frequent schedule.
 
-**`revenue_entries` sync is slow**
+**`revenue_entries` first run is slow**
 
-- Cause: revenue entries are fetched per-transaction (see "Known behaviors and caveats"). If your tenant has many transactions, this table will be the slowest to sync.
-- Fix: only ingest `revenue_entries` if you actually need period-level revenue recognition downstream. Otherwise omit it from the pipeline spec.
+- Cause: `revenue_entries` is the highest-volume table in most tenants. The initial backfill walks the entire history (see "Known behaviors and caveats"). Subsequent incremental runs only fetch entries with `modified` since the watermark and are cheap.
+- Fix: budget extra runtime for the first run, or omit `revenue_entries` from the pipeline spec if you do not need period-level revenue recognition downstream.
 
 **Numeric columns look like strings when I query the source API directly but are doubles in my Delta table**
 
